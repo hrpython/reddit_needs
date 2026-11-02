@@ -15,3 +15,6 @@ venv/
 # IDE
 .idea/
 .vscode/
+
+# Brouillon de la demande d'accès Reddit (contient des champs à remplir)
+demande_acces_reddit.txt

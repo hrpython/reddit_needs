@@ -8,7 +8,7 @@ Usage :
     python reddit_needs_agent.py collect     # récupère les posts candidats
     python reddit_needs_agent.py analyze     # analyse LLM des candidats
     python reddit_needs_agent.py report      # génère le rapport Markdown + CSV
-    python reddit_needs_agent.py purge       # supprime les données de plus de 90 jours (auto avant collect)
+    python reddit_needs_agent.py purge       # applique la politique de conservation (auto avant collect/report)
     python reddit_needs_agent.py all         # enchaîne les trois
 """
 
@@ -20,7 +20,7 @@ import re
 import sqlite3
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import requests
@@ -112,6 +112,9 @@ MAX_COMMENTS_PER_POST = 25
 MIN_COMMENTS_TO_READ = 3
 MAX_POSTS_TO_ANALYZE_PER_RUN = 300
 MAX_TEXT_CHARS_FOR_LLM = 5000
+# Le corps du post ne doit pas absorber tout le budget : il reste de la place pour les commentaires
+MAX_BODY_CHARS_FOR_LLM = 3000
+DELETED_MARKERS = ("[deleted]", "[removed]")
 # Erreurs réseau / serveur LLM : nouvelles tentatives, puis arrêt du run (les posts restent 'pending')
 MAX_LLM_RETRIES = 3
 MAX_CONSECUTIVE_LLM_FAILURES = 3
@@ -191,7 +194,7 @@ def reddit_ready():
 
 def is_gone(post):
     """Post supprimé (par son auteur) ou retiré (modération, filtre anti-spam) sur Reddit."""
-    return bool(post.get("removed_by_category")) or post.get("selftext") in ("[deleted]", "[removed]")
+    return bool(post.get("removed_by_category")) or post.get("selftext") in DELETED_MARKERS
 
 
 def verify_deletions(conn):
@@ -365,7 +368,7 @@ def fetch_comments(post_id):
     out = []
     for c in data[1].get("data", {}).get("children", []):
         body = c.get("data", {}).get("body") if c.get("kind") == "t1" else None
-        if body and body not in ("[deleted]", "[removed]"):
+        if body and body not in DELETED_MARKERS:
             out.append(body)
     return out[:MAX_COMMENTS_PER_POST]
 
@@ -381,60 +384,80 @@ def save_post(conn, s, sub_name, status, text=""):
     )
 
 
+def normalize_text(text):
+    """Apostrophes typographiques -> droites, pour que les regex (can't, i'm...) matchent aussi sur mobile."""
+    return text.replace("’", "'").replace("‘", "'")
+
+
+def post_body(s):
+    """Titre + corps du post, sans les marqueurs de suppression."""
+    selftext = s.get("selftext") or ""
+    if selftext in DELETED_MARKERS:
+        selftext = ""
+    return normalize_text(f"{s.get('title', '')}\n{selftext}")
+
+
+def build_llm_text(body, comments_text):
+    """Texte envoyé au LLM : le corps et les commentaires ont chacun leur part du budget."""
+    body = body[:MAX_BODY_CHARS_FOR_LLM]
+    header = "\n\nCOMMENTAIRES:\n"
+    room = max(0, MAX_TEXT_CHARS_FOR_LLM - len(body) - len(header))
+    return body + header + comments_text[:room]
+
+
+def evaluate_post(s):
+    """Décide du sort d'un post : renvoie (statut, texte pour le LLM)."""
+    body = post_body(s)
+    matched = bool(NEED_REGEX.search(body))
+    comments_text = ""
+
+    if s.get("num_comments", 0) >= MIN_COMMENTS_TO_READ and (matched or s.get("score", 0) >= 20):
+        comments_text = normalize_text("\n---\n".join(fetch_comments(s["id"])))
+        matched = matched or bool(NEED_REGEX.search(comments_text))
+
+    if not matched:
+        return "skipped", ""
+
+    # Filtre États-Unis : on écarte les posts avec signaux hors US sans aucun signal US
+    check_text = body + "\n" + comments_text
+    if NON_US_SIGNALS.search(check_text) and not US_SIGNALS.search(check_text):
+        return "non_us", ""
+
+    return "pending", build_llm_text(body, comments_text)
+
+
+def collect_subreddit(conn, sub_name):
+    """Collecte un subreddit ; renvoie le nombre de nouveaux candidats à analyser."""
+    submissions = fetch_listing(sub_name, "new", POSTS_PER_SUBREDDIT_NEW)
+    submissions += fetch_listing(sub_name, "top", POSTS_PER_SUBREDDIT_TOP_WEEK, t="week")
+    if not submissions:
+        print(f"  ! aucun post récupéré pour r/{sub_name}")
+        return 0
+
+    added, seen = 0, set()
+    for s in submissions:
+        sid = s.get("id")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        if conn.execute("SELECT 1 FROM posts WHERE id=?", (sid,)).fetchone():
+            continue
+
+        status, text = evaluate_post(s)
+        save_post(conn, s, sub_name, status, text)
+        added += status == "pending"
+    conn.commit()
+    return added
+
+
 def collect():
     require_reddit_credentials()
     purge()
     conn = db_connect()
     added = 0
-
     for sub_name in SUBREDDITS:
         print(f"[collect] r/{sub_name}")
-        submissions = fetch_listing(sub_name, "new", POSTS_PER_SUBREDDIT_NEW)
-        submissions += fetch_listing(sub_name, "top", POSTS_PER_SUBREDDIT_TOP_WEEK, t="week")
-        if not submissions:
-            print(f"  ! aucun post récupéré pour r/{sub_name}")
-            continue
-
-        seen = set()
-        for s in submissions:
-            sid = s.get("id")
-            if not sid or sid in seen:
-                continue
-            seen.add(sid)
-            if conn.execute("SELECT 1 FROM posts WHERE id=?", (sid,)).fetchone():
-                continue
-
-            title = s.get("title", "")
-            selftext = s.get("selftext") or ""
-            if selftext in ("[removed]", "[deleted]"):
-                selftext = ""
-            score = s.get("score", 0)
-            num_comments = s.get("num_comments", 0)
-
-            body = f"{title}\n{selftext}"
-            matched = bool(NEED_REGEX.search(body))
-            comments_text = ""
-
-            if num_comments >= MIN_COMMENTS_TO_READ and (matched or score >= 20):
-                comments_text = "\n---\n".join(fetch_comments(sid))
-                if not matched and NEED_REGEX.search(comments_text):
-                    matched = True
-
-            if not matched:
-                save_post(conn, s, sub_name, "skipped")
-                continue
-
-            # Filtre États-Unis : on écarte les posts avec signaux hors US sans aucun signal US
-            check_text = body + "\n" + comments_text
-            if NON_US_SIGNALS.search(check_text) and not US_SIGNALS.search(check_text):
-                save_post(conn, s, sub_name, "non_us")
-                continue
-
-            full_text = (body + "\n\nCOMMENTAIRES:\n" + comments_text)[:MAX_TEXT_CHARS_FOR_LLM]
-            save_post(conn, s, sub_name, "pending", full_text)
-            added += 1
-        conn.commit()
-
+        added += collect_subreddit(conn, sub_name)
     print(f"[collect] terminé : {added} nouveaux candidats")
 
 
@@ -503,6 +526,11 @@ def as_int(value, default=0):
         return default
 
 
+def clamp_int(value, low, high):
+    """Entier ramené dans [low, high] : le LLM peut sortir de l'échelle demandée."""
+    return max(low, min(high, as_int(value)))
+
+
 def as_bool(value):
     """Booléen tolérant : le LLM peut renvoyer "false" / "null" en chaîne."""
     if isinstance(value, str):
@@ -548,9 +576,9 @@ def analyze():
                 "INSERT OR REPLACE INTO needs VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     row["id"], data.get("need", ""), (data.get("category") or "other").lower().strip(),
-                    data.get("audience", ""), as_int(data.get("intensity")),
-                    data.get("current_solution", ""), as_int(data.get("willingness_to_pay")),
-                    as_int(data.get("digital_feasibility")), data.get("evidence", ""),
+                    data.get("audience", ""), clamp_int(data.get("intensity"), 1, 5),
+                    data.get("current_solution", ""), clamp_int(data.get("willingness_to_pay"), 0, 3),
+                    clamp_int(data.get("digital_feasibility"), 1, 5), data.get("evidence", ""),
                     json.dumps(data, ensure_ascii=False),
                 ),
             )
@@ -567,10 +595,76 @@ def analyze():
 # ----------------------------------------------------------------------------
 # RAPPORT
 # ----------------------------------------------------------------------------
+GENERIC_CATEGORY_WORDS = {
+    "management", "manager", "tool", "tools", "app", "apps", "software", "automation",
+    "platform", "system", "service", "services", "solution", "solutions",
+}
+STEM_SUFFIXES = ("ings", "ing", "ions", "ion", "ers", "er", "es", "s")
+
+
 def need_score(r):
     """Score d'un besoin individuel."""
     traction = math.log1p(max(r["score"], 0)) + math.log1p(max(r["num_comments"], 0))
     return (r["intensity"] * (1 + r["willingness_to_pay"]) * r["digital_feasibility"]) * (1 + traction / 5)
+
+
+def category_key(category):
+    """Clé de regroupement : 'invoicing', 'invoice management' et 'Invoices' donnent la même clé."""
+    stems = set()
+    for word in re.findall(r"[a-z0-9]+", category.lower()):
+        if word in GENERIC_CATEGORY_WORDS:
+            continue
+        for suffix in STEM_SUFFIXES:
+            if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+                word = word[:-len(suffix)]
+                break
+        stems.add(word.rstrip("e"))
+    return " ".join(sorted(stems)) or category.lower()
+
+
+def rank_categories(rows):
+    """Regroupe les besoins par catégorie (libellés proches fusionnés) et classe les groupes."""
+    groups = defaultdict(list)
+    for r in rows:
+        groups[category_key(r["category"])].append(r)
+
+    ranked = []
+    for items in groups.values():
+        label = Counter(x["category"] for x in items).most_common(1)[0][0]
+        mean = sum(need_score(x) for x in items) / len(items)
+        # qualité moyenne des besoins x fréquence (une seule fois, en log) : plusieurs posts
+        # indépendants sur la même catégorie comptent, sans écraser les catégories plus rares
+        ranked.append((mean * (1 + math.log(len(items))), label, items))
+    ranked.sort(key=lambda t: t[0], reverse=True)
+    return ranked
+
+
+def write_csv_report(ranked):
+    with open(REPORT_CSV, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["categorie", "score_cat", "nb_posts", "need", "audience", "intensite",
+                    "volonte_payer", "faisabilite", "solution_actuelle", "subreddit", "url"])
+        for total, cat, items in ranked:
+            for x in sorted(items, key=need_score, reverse=True):
+                w.writerow([cat, round(total, 1), len(items), x["need"], x["audience"],
+                            x["intensity"], x["willingness_to_pay"], x["digital_feasibility"],
+                            x["current_solution"], x["subreddit"], x["url"]])
+
+
+def write_markdown_report(ranked, nb_needs):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    with open(REPORT_MD, "w", encoding="utf-8") as f:
+        f.write(f"# Besoins détectés sur Reddit\n\nGénéré le {now} — {nb_needs} besoins, "
+                f"{len(ranked)} catégories\n\n")
+        for rank, (total, cat, items) in enumerate(ranked[:30], 1):
+            f.write(f"## {rank}. {cat} (score {total:.0f}, {len(items)} posts)\n\n")
+            for x in sorted(items, key=need_score, reverse=True)[:5]:
+                f.write(f"- **{x['need']}**  \n"
+                        f"  Public : {x['audience']} | intensité {x['intensity']}/5 | "
+                        f"paiement {x['willingness_to_pay']}/3 | faisabilité {x['digital_feasibility']}/5  \n"
+                        f"  Aujourd'hui : {x['current_solution']}  \n"
+                        f"  r/{x['subreddit']} — [voir le post]({x['url']})\n")
+            f.write("\n")
 
 
 def report():
@@ -583,41 +677,9 @@ def report():
     if not rows:
         sys.exit("Aucun besoin en base : lancez d'abord collect puis analyze.")
 
-    groups = defaultdict(list)
-    for r in rows:
-        groups[r["category"]].append(r)
-
-    ranked = []
-    for cat, items in groups.items():
-        total = sum(need_score(x) for x in items)
-        # la fréquence compte : plusieurs posts indépendants sur la même catégorie
-        ranked.append((total * (1 + math.log(len(items))), cat, items))
-    ranked.sort(key=lambda t: t[0], reverse=True)
-
-    with open(REPORT_CSV, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow(["categorie", "score_cat", "nb_posts", "need", "audience", "intensite",
-                    "volonte_payer", "faisabilite", "solution_actuelle", "subreddit", "url"])
-        for total, cat, items in ranked:
-            for x in sorted(items, key=need_score, reverse=True):
-                w.writerow([cat, round(total, 1), len(items), x["need"], x["audience"],
-                            x["intensity"], x["willingness_to_pay"], x["digital_feasibility"],
-                            x["current_solution"], x["subreddit"], x["url"]])
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    with open(REPORT_MD, "w", encoding="utf-8") as f:
-        f.write(f"# Besoins détectés sur Reddit\n\nGénéré le {now} — {len(rows)} besoins, "
-                f"{len(ranked)} catégories\n\n")
-        for rank, (total, cat, items) in enumerate(ranked[:30], 1):
-            f.write(f"## {rank}. {cat} (score {total:.0f}, {len(items)} posts)\n\n")
-            for x in sorted(items, key=need_score, reverse=True)[:5]:
-                f.write(f"- **{x['need']}**  \n"
-                        f"  Public : {x['audience']} | intensité {x['intensity']}/5 | "
-                        f"paiement {x['willingness_to_pay']}/3 | faisabilité {x['digital_feasibility']}/5  \n"
-                        f"  Aujourd'hui : {x['current_solution']}  \n"
-                        f"  r/{x['subreddit']} — [voir le post]({x['url']})\n")
-            f.write("\n")
-
+    ranked = rank_categories(rows)
+    write_csv_report(ranked)
+    write_markdown_report(ranked, len(rows))
     print(f"[report] {REPORT_MD}\n[report] {REPORT_CSV}")
 
 
