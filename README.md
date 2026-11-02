@@ -29,6 +29,7 @@ Le fichier `.env` contient les identifiants et n'est jamais versionné.
 python reddit_needs_agent.py collect
 python reddit_needs_agent.py analyze
 python reddit_needs_agent.py report
+python reddit_needs_agent.py purge   # supprime les données de plus de 90 jours
 python reddit_needs_agent.py all
 ```
 
@@ -46,4 +47,4 @@ Ce projet est conçu pour respecter la [Responsible Builder Policy](https://supp
 - **Pas de profilage** : aucun nom d'utilisateur n'est collecté ni stocké. Seuls le titre, le texte, le score et les commentaires sont conservés pour analyser les *besoins exprimés*, jamais les personnes. Aucune caractéristique sensible n'est déduite.
 - **Pas d'entraînement de modèle** : le LLM est utilisé en inférence uniquement, sur un serveur contrôlé par l'auteur. Les données Reddit ne servent ni à entraîner, ni à affiner un modèle.
 - **Pas de redistribution** : la base et les rapports restent locaux et ne sont pas publiés.
-- **Conservation** : les données locales peuvent être supprimées à tout moment (suppression de `needs.db`).
+- **Conservation limitée** : les posts, commentaires et rapports sont supprimés automatiquement au bout de 90 jours (`RETENTION_DAYS`). La purge s'exécute avant chaque `collect`, ou à la demande avec `python reddit_needs_agent.py purge`. Les données locales peuvent aussi être supprimées à tout moment (suppression de `needs.db`).

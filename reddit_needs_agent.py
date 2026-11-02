@@ -8,6 +8,7 @@ Usage :
     python reddit_needs_agent.py collect     # récupère les posts candidats
     python reddit_needs_agent.py analyze     # analyse LLM des candidats
     python reddit_needs_agent.py report      # génère le rapport Markdown + CSV
+    python reddit_needs_agent.py purge       # supprime les données de plus de 90 jours (auto avant collect)
     python reddit_needs_agent.py all         # enchaîne les trois
 """
 
@@ -60,6 +61,8 @@ REDDIT_API_BASE = "https://oauth.reddit.com"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 # Pause entre deux requêtes : à régler selon les limites accordées par Reddit.
 REQUEST_DELAY_SECONDS = float(os.environ.get("REQUEST_DELAY_SECONDS", "2"))
+# Durée de conservation des données Reddit (posts, commentaires, rapports), purgées au-delà
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 
 # LLM : serveur vLLM (API compatible OpenAI), par ex. joignable via Tailscale
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
@@ -158,7 +161,8 @@ def db_connect():
             id TEXT PRIMARY KEY,
             subreddit TEXT, title TEXT, url TEXT, score INTEGER,
             num_comments INTEGER, created_utc REAL, text TEXT,
-            status TEXT DEFAULT 'pending'
+            status TEXT DEFAULT 'pending',
+            collected_at REAL
         );
         CREATE TABLE IF NOT EXISTS needs (
             post_id TEXT PRIMARY KEY,
@@ -168,8 +172,34 @@ def db_connect():
         );
         """
     )
+    # Migration : bases créées avant l'ajout de collected_at (les lignes existantes démarrent à "maintenant")
+    columns = [c["name"] for c in conn.execute("PRAGMA table_info(posts)")]
+    if "collected_at" not in columns:
+        conn.execute("ALTER TABLE posts ADD COLUMN collected_at REAL")
+    conn.execute("UPDATE posts SET collected_at=? WHERE collected_at IS NULL", (time.time(),))
     conn.commit()
     return conn
+
+
+def purge():
+    """Supprime les données Reddit conservées depuis plus de RETENTION_DAYS jours (base et rapports)."""
+    conn = db_connect()
+    cutoff = time.time() - RETENTION_DAYS * 86400
+    old_ids = "SELECT id FROM posts WHERE collected_at < ?"
+    conn.execute(f"DELETE FROM needs WHERE post_id IN ({old_ids})", (cutoff,))
+    deleted = conn.execute("DELETE FROM posts WHERE collected_at < ?", (cutoff,)).rowcount
+    conn.commit()
+    if deleted:
+        conn.execute("VACUUM")  # libère réellement l'espace : les textes supprimés ne restent pas dans le fichier
+    conn.close()
+
+    # Les rapports reprennent des titres et liens de posts : même durée de conservation
+    removed_reports = 0
+    for path in (REPORT_MD, REPORT_CSV):
+        if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+            os.remove(path)
+            removed_reports += 1
+    print(f"[purge] {deleted} posts et {removed_reports} rapports de plus de {RETENTION_DAYS} jours supprimés")
 
 
 # ----------------------------------------------------------------------------
@@ -278,15 +308,16 @@ def fetch_comments(post_id):
 def save_post(conn, s, sub_name, status, text=""):
     """Mémorise un post. Les posts écartés sont gardés (sans texte) pour ne pas être re-téléchargés."""
     conn.execute(
-        "INSERT OR IGNORE INTO posts (id, subreddit, title, url, score, num_comments, created_utc, text, status) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO posts (id, subreddit, title, url, score, num_comments, created_utc, text, status, "
+        "collected_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (s["id"], sub_name, s.get("title", ""), f"https://reddit.com{s.get('permalink', '')}",
-         s.get("score", 0), s.get("num_comments", 0), s.get("created_utc", 0), text, status),
+         s.get("score", 0), s.get("num_comments", 0), s.get("created_utc", 0), text, status, time.time()),
     )
 
 
 def collect():
     require_reddit_credentials()
+    purge()
     conn = db_connect()
     added = 0
 
@@ -532,9 +563,11 @@ if __name__ == "__main__":
         analyze()
     elif cmd == "report":
         report()
+    elif cmd == "purge":
+        purge()
     elif cmd == "all":
         collect()
         analyze()
         report()
     else:
-        sys.exit("Commande inconnue : collect | analyze | report | all")
+        sys.exit("Commande inconnue : collect | analyze | report | purge | all")
