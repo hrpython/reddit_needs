@@ -35,3 +35,15 @@ python reddit_needs_agent.py all
 ## Données
 
 La base `needs.db` et les rapports contiennent des données issues de Reddit : ils sont exclus du dépôt (`.gitignore`) et ne doivent pas être redistribués.
+
+## Conformité et usage des données
+
+Ce projet est conçu pour respecter la [Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy) de Reddit :
+
+- **Lecture seule** : aucun post, commentaire, vote ni message n'est envoyé sur Reddit.
+- **Accès approuvé** : `collect` refuse de s'exécuter sans identifiants API, et ne lit pas Reddit de façon anonyme.
+- **Volume limité** : environ 30 subreddits, quelques centaines de posts par exécution, avec une pause entre les requêtes (`REQUEST_DELAY_SECONDS`) et gestion des erreurs 429.
+- **Pas de profilage** : aucun nom d'utilisateur n'est collecté ni stocké. Seuls le titre, le texte, le score et les commentaires sont conservés pour analyser les *besoins exprimés*, jamais les personnes. Aucune caractéristique sensible n'est déduite.
+- **Pas d'entraînement de modèle** : le LLM est utilisé en inférence uniquement, sur un serveur contrôlé par l'auteur. Les données Reddit ne servent ni à entraîner, ni à affiner un modèle.
+- **Pas de redistribution** : la base et les rapports restent locaux et ne sont pas publiés.
+- **Conservation** : les données locales peuvent être supprimées à tout moment (suppression de `needs.db`).
