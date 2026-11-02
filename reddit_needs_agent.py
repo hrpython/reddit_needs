@@ -61,7 +61,10 @@ REDDIT_API_BASE = "https://oauth.reddit.com"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 # Pause entre deux requêtes : à régler selon les limites accordées par Reddit.
 REQUEST_DELAY_SECONDS = float(os.environ.get("REQUEST_DELAY_SECONDS", "2"))
-# Durée de conservation des données Reddit (posts, commentaires, rapports), purgées au-delà
+# Conservation des données Reddit : le texte brut (posts, commentaires) est supprimé dès l'analyse
+# terminée, et au plus tard après 48 h (recommandation de Reddit). Les résultats d'analyse et les
+# rapports sont conservés RETENTION_DAYS jours, tant que le post source existe encore sur Reddit.
+TEXT_RETENTION_HOURS = int(os.environ.get("TEXT_RETENTION_HOURS", "48"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 
 # LLM : serveur vLLM (API compatible OpenAI), par ex. joignable via Tailscale
@@ -155,6 +158,7 @@ def db_connect():
     os.makedirs(BASE_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA secure_delete=ON")  # les données supprimées sont écrasées, pas seulement déréférencées
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS posts (
@@ -181,25 +185,86 @@ def db_connect():
     return conn
 
 
-def purge():
-    """Supprime les données Reddit conservées depuis plus de RETENTION_DAYS jours (base et rapports)."""
-    conn = db_connect()
-    cutoff = time.time() - RETENTION_DAYS * 86400
-    old_ids = "SELECT id FROM posts WHERE collected_at < ?"
-    conn.execute(f"DELETE FROM needs WHERE post_id IN ({old_ids})", (cutoff,))
-    deleted = conn.execute("DELETE FROM posts WHERE collected_at < ?", (cutoff,)).rowcount
+def reddit_ready():
+    return bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET) and "VOTRE_PSEUDO" not in REDDIT_USER_AGENT
+
+
+def is_gone(post):
+    """Post supprimé (par son auteur) ou retiré (modération, filtre anti-spam) sur Reddit."""
+    return bool(post.get("removed_by_category")) or post.get("selftext") in ("[deleted]", "[removed]")
+
+
+def verify_deletions(conn):
+    """Supprime de la base les posts qui n'existent plus sur Reddit (obligation de la Data API).
+    Ne vérifie que les lignes qui portent du contenu ou un résultat dérivé. Renvoie le nombre supprimé."""
+    ids = [r["id"] for r in conn.execute("SELECT id FROM posts WHERE status IN ('pending','error','need')")]
+    gone = []
+    for i in range(0, len(ids), 100):
+        batch = ids[i:i + 100]
+        data = reddit_get(f"{REDDIT_API_BASE}/api/info",
+                          {"id": ",".join(f"t3_{x}" for x in batch), "raw_json": 1})
+        if not data or "data" not in data:
+            print("  ! vérification des suppressions impossible pour un lot, ignoré")
+            continue
+        alive = {c["data"]["id"]: c["data"] for c in data["data"].get("children", []) if c.get("kind") == "t3"}
+        if not alive and len(batch) >= 10:
+            print("  ! réponse vide suspecte pour un lot, ignoré")
+            continue
+        gone += [x for x in batch if x not in alive or is_gone(alive[x])]
+    for post_id in gone:
+        conn.execute("DELETE FROM needs WHERE post_id=?", (post_id,))
+        conn.execute("DELETE FROM posts WHERE id=?", (post_id,))
     conn.commit()
-    if deleted:
-        conn.execute("VACUUM")  # libère réellement l'espace : les textes supprimés ne restent pas dans le fichier
+    return len(gone)
+
+
+def purge():
+    """Applique la politique de conservation des données Reddit :
+    - titres et liens avec titre : jamais conservés ;
+    - texte brut des posts et citations : supprimés après TEXT_RETENTION_HOURS (ou dès l'analyse terminée) ;
+    - posts supprimés sur Reddit : retirés de la base, ainsi que les rapports qui les mentionnaient ;
+    - tout le reste (résultats d'analyse, rapports) : supprimé après RETENTION_DAYS jours."""
+    conn = db_connect()
+    now = time.time()
+    text_cutoff = now - TEXT_RETENTION_HOURS * 3600
+    cutoff = now - RETENTION_DAYS * 86400
+
+    scrubbed = conn.execute("UPDATE posts SET title='' WHERE title IS NOT NULL AND title != ''").rowcount
+    scrubbed += conn.execute(
+        "UPDATE posts SET url='https://www.reddit.com/comments/' || id "
+        "WHERE url IS NOT 'https://www.reddit.com/comments/' || id").rowcount
+    expired = conn.execute(
+        "UPDATE posts SET status='expired' WHERE status='pending' AND collected_at < ?", (text_cutoff,)).rowcount
+    scrubbed += conn.execute(
+        "UPDATE posts SET text='' WHERE text IS NOT NULL AND text != '' AND collected_at < ?",
+        (text_cutoff,)).rowcount
+    conn.execute(
+        "UPDATE needs SET evidence='', raw_json='' WHERE (evidence != '' OR raw_json != '') "
+        "AND post_id IN (SELECT id FROM posts WHERE collected_at < ?)", (text_cutoff,))
+
+    conn.execute("DELETE FROM needs WHERE post_id IN (SELECT id FROM posts WHERE collected_at < ?)", (cutoff,))
+    old = conn.execute("DELETE FROM posts WHERE collected_at < ?", (cutoff,)).rowcount
+    conn.commit()
+
+    gone = 0
+    if reddit_ready():
+        gone = verify_deletions(conn)
+    else:
+        print("[purge] identifiants Reddit absents : vérification des posts supprimés ignorée")
+
+    if scrubbed or old or gone:
+        conn.execute("VACUUM")  # le contenu supprimé ne doit pas rester dans le fichier de la base
     conn.close()
 
-    # Les rapports reprennent des titres et liens de posts : même durée de conservation
+    # Les rapports reprennent des résultats d'analyse : même durée de conservation, et supprimés
+    # dès qu'un post source disparaît de Reddit (ils se régénèrent avec la commande report)
     removed_reports = 0
     for path in (REPORT_MD, REPORT_CSV):
-        if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+        if os.path.isfile(path) and (gone or os.path.getmtime(path) < cutoff):
             os.remove(path)
             removed_reports += 1
-    print(f"[purge] {deleted} posts et {removed_reports} rapports de plus de {RETENTION_DAYS} jours supprimés")
+    print(f"[purge] {old} posts de plus de {RETENTION_DAYS} jours, {gone} posts supprimés sur Reddit, "
+          f"{expired} textes non analysés expirés, {removed_reports} rapports supprimés")
 
 
 # ----------------------------------------------------------------------------
@@ -310,7 +375,8 @@ def save_post(conn, s, sub_name, status, text=""):
     conn.execute(
         "INSERT OR IGNORE INTO posts (id, subreddit, title, url, score, num_comments, created_utc, text, status, "
         "collected_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (s["id"], sub_name, s.get("title", ""), f"https://reddit.com{s.get('permalink', '')}",
+        # Pas de titre ni de permalien (qui contient le titre) : seul l'identifiant sert à retrouver le post
+        (s["id"], sub_name, "", f"https://www.reddit.com/comments/{s['id']}",
          s.get("score", 0), s.get("num_comments", 0), s.get("created_utc", 0), text, status, time.time()),
     )
 
@@ -476,7 +542,7 @@ def analyze():
         # Hors US seulement si le LLM l'affirme (false) ; null / absent = inconnu, on garde
         non_us = "us_based" in data and data["us_based"] is not None and not as_bool(data["us_based"])
         if as_bool(data.get("has_need")) and non_us:
-            conn.execute("UPDATE posts SET status='non_us' WHERE id=?", (row["id"],))
+            conn.execute("UPDATE posts SET status='non_us', text='' WHERE id=?", (row["id"],))
         elif as_bool(data.get("has_need")):
             conn.execute(
                 "INSERT OR REPLACE INTO needs VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -488,9 +554,9 @@ def analyze():
                     json.dumps(data, ensure_ascii=False),
                 ),
             )
-            conn.execute("UPDATE posts SET status='need' WHERE id=?", (row["id"],))
+            conn.execute("UPDATE posts SET status='need', text='' WHERE id=?", (row["id"],))
         else:
-            conn.execute("UPDATE posts SET status='no_need' WHERE id=?", (row["id"],))
+            conn.execute("UPDATE posts SET status='no_need', text='' WHERE id=?", (row["id"],))
         conn.commit()
         if i % 10 == 0:
             print(f"  {i}/{len(rows)}")
@@ -508,9 +574,10 @@ def need_score(r):
 
 
 def report():
+    purge()  # le rapport ne doit jamais citer un post supprimé sur Reddit ni des données expirées
     conn = db_connect()
     rows = conn.execute(
-        "SELECT n.*, p.subreddit, p.title, p.url, p.score, p.num_comments "
+        "SELECT n.*, p.subreddit, p.url, p.score, p.num_comments "
         "FROM needs n JOIN posts p ON p.id = n.post_id"
     ).fetchall()
     if not rows:
@@ -548,7 +615,7 @@ def report():
                         f"  Public : {x['audience']} | intensité {x['intensity']}/5 | "
                         f"paiement {x['willingness_to_pay']}/3 | faisabilité {x['digital_feasibility']}/5  \n"
                         f"  Aujourd'hui : {x['current_solution']}  \n"
-                        f"  r/{x['subreddit']} — [{x['title'][:80]}]({x['url']})\n")
+                        f"  r/{x['subreddit']} — [voir le post]({x['url']})\n")
             f.write("\n")
 
     print(f"[report] {REPORT_MD}\n[report] {REPORT_CSV}")
