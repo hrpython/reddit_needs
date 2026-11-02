@@ -1,0 +1,17 @@
+# Secrets et configuration locale
+.env
+
+# Données Reddit collectées et rapports générés (ne pas redistribuer, cf. Responsible Builder Policy)
+*.db
+*.db-journal
+rapport_besoins.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
