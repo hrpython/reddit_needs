@@ -53,10 +53,10 @@ REPORT_CSV = os.path.join(BASE_DIR, "rapport_besoins.csv")
 
 # Reddit : API officielle (OAuth), accès soumis à l'approbation de Reddit
 # (voir la Responsible Builder Policy). Les identifiants viennent du fichier .env.
-# Le User-Agent doit être unique et identifiable : "nom-app/version by u/pseudo".
+# Le User-Agent doit suivre le format imposé par Reddit : <plateforme>:<id app>:<version> (by /u/<pseudo>)
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
-REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "needs-finder/0.1 by u/VOTRE_PSEUDO")
+REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "windows:needs-finder:v0.1 (by /u/VOTRE_PSEUDO)")
 REDDIT_API_BASE = "https://oauth.reddit.com"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 # Pause entre deux requêtes : à régler selon les limites accordées par Reddit.
@@ -213,7 +213,7 @@ def require_reddit_credentials():
         sys.exit("Identifiants Reddit manquants : renseignez REDDIT_CLIENT_ID et REDDIT_CLIENT_SECRET "
                  "dans le fichier .env (voir .env.example). L'accès à l'API doit être approuvé par Reddit.")
     if "VOTRE_PSEUDO" in REDDIT_USER_AGENT:
-        sys.exit("Renseignez REDDIT_USER_AGENT dans .env (ex. : needs-finder/0.1 by u/votre_pseudo).")
+        sys.exit("Renseignez REDDIT_USER_AGENT dans .env (ex. : windows:needs-finder:v0.1 (by /u/votre_pseudo)).")
 
 
 def reddit_access_token():
